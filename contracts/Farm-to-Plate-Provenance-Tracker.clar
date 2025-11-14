@@ -5,6 +5,7 @@
 (define-constant ERR-INVALID-STATUS (err u103))
 (define-constant ERR-NOT-SUPPLIER (err u104))
 (define-constant ERR-INVALID-STAGE (err u105))
+(define-constant ERR-INVALID-TEMPERATURE-RANGE (err u106))
 
 (define-constant STATUS-HARVESTED u1)
 (define-constant STATUS-PROCESSED u2)
@@ -67,6 +68,23 @@
 (define-map product-supplier-count
     uint
     uint
+)
+
+(define-map product-quality-config
+    uint
+    {
+        min-temp: int,
+        max-temp: int,
+        max-age-blocks: uint
+    }
+)
+
+(define-map product-violations
+    uint
+    {
+        temperature-violations: uint,
+        total-violations: uint
+    }
 )
 
 (define-public (register-supplier (name (string-ascii 100)) (supplier-type (string-ascii 50)) (certification (string-ascii 100)))
@@ -268,4 +286,106 @@
         })
         ERR-PRODUCT-NOT-FOUND
     )
+)
+
+(define-public (set-quality-config 
+    (product-id uint)
+    (min-temp int)
+    (max-temp int)
+    (max-age-blocks uint)
+)
+    (let
+        (
+            (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+        )
+        (asserts! (is-eq (get current-holder product) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (< min-temp max-temp) ERR-INVALID-TEMPERATURE-RANGE)
+        (map-set product-quality-config product-id {
+            min-temp: min-temp,
+            max-temp: max-temp,
+            max-age-blocks: max-age-blocks
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-temperature-violation (product-id uint) (temp (optional int)))
+    (match (map-get? product-quality-config product-id)
+        config (match temp
+            temperature (let
+                (
+                    (violations (default-to { temperature-violations: u0, total-violations: u0 } 
+                        (map-get? product-violations product-id)))
+                    (is-violation (or (< temperature (get min-temp config)) 
+                        (> temperature (get max-temp config))))
+                )
+                (if is-violation
+                    (map-set product-violations product-id {
+                        temperature-violations: (+ (get temperature-violations violations) u1),
+                        total-violations: (+ (get total-violations violations) u1)
+                    })
+                    true
+                )
+            )
+            true
+        )
+        true
+    )
+)
+
+(define-public (record-temperature-check 
+    (product-id uint)
+    (temperature int)
+)
+    (let
+        (
+            (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+        )
+        (asserts! (get is-active product) ERR-INVALID-STATUS)
+        (check-temperature-violation product-id (some temperature))
+        (ok true)
+    )
+)
+
+(define-read-only (get-quality-score (product-id uint))
+    (match (map-get? products product-id)
+        product (let
+            (
+                (violations (default-to { temperature-violations: u0, total-violations: u0 } 
+                    (map-get? product-violations product-id)))
+                (blocks-elapsed (- stacks-block-height (get harvest-date product)))
+                (config (map-get? product-quality-config product-id))
+                (age-penalty (match config
+                    cfg (if (> blocks-elapsed (get max-age-blocks cfg))
+                        (/ (* (- blocks-elapsed (get max-age-blocks cfg)) u50) 
+                            (get max-age-blocks cfg))
+                        u0
+                    )
+                    u0
+                ))
+                (violation-penalty (* (get total-violations violations) u10))
+                (total-penalty (+ age-penalty violation-penalty))
+                (final-score (if (> total-penalty u100) u0 (- u100 total-penalty)))
+            )
+            (ok {
+                product-id: product-id,
+                quality-score: final-score,
+                temperature-violations: (get temperature-violations violations),
+                total-violations: (get total-violations violations),
+                age-penalty: age-penalty,
+                violation-penalty: violation-penalty,
+                blocks-elapsed: blocks-elapsed
+            })
+        )
+        ERR-PRODUCT-NOT-FOUND
+    )
+)
+
+(define-read-only (get-quality-config (product-id uint))
+    (ok (map-get? product-quality-config product-id))
+)
+
+(define-read-only (get-violations (product-id uint))
+    (ok (default-to { temperature-violations: u0, total-violations: u0 } 
+        (map-get? product-violations product-id)))
 )
